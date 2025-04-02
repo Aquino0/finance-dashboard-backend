@@ -1,13 +1,14 @@
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import yfinance as yf
 import requests
 from datetime import datetime
-from typing import List, Optional
+import sqlite3
 
 app = FastAPI()
 
-# CORS Middleware
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,7 +17,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-historico_consultas = []
+# Modelo para validação dos dados
+class HistoricoItem(BaseModel):
+    data_consulta: str
+    tipo: str
+    codigo: str
+    nome: str
+    preco: str
+    variacao: str
+
+# Banco
+def init_db():
+    conn = sqlite3.connect("stocks.db")
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS historico (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data_consulta TEXT,
+            tipo TEXT,
+            codigo TEXT,
+            nome TEXT,
+            preco TEXT,
+            variacao TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+init_db()
 
 @app.get("/consulta")
 def consulta(tipo: str = Query(...), codigo: str = Query(...)):
@@ -24,143 +52,116 @@ def consulta(tipo: str = Query(...), codigo: str = Query(...)):
     if tipo == "acao" and not codigo.endswith(".SA") and not codigo.isalpha():
         codigo += ".SA"
 
-    if tipo == "acao":
-        try:
+    try:
+        if tipo == "acao":
             ticker = yf.Ticker(codigo)
             info = ticker.info or {}
             nome = info.get("shortName") or info.get("longName")
             preco = info.get("currentPrice")
             variacao = info.get("regularMarketChangePercent")
-
-            if nome is None or preco is None:
-                return {"erro": "Código de ação inválido ou sem dados disponíveis."}
-
-            if isinstance(preco, float):
-                preco = f"{preco:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            if isinstance(variacao, float):
-                variacao = f"{variacao:.2f}".replace(".", ",")
-
-            data_atual = datetime.now().strftime("%d/%m/%Y")
-            historico_consultas.insert(0, {
-                "id": len(historico_consultas) + 1,
-                "data_consulta": data_atual,
-                "tipo": tipo,
-                "codigo": codigo,
-                "nome": nome.upper(),
-                "preco": preco,
-                "variacao": variacao
-            })
-
-            return {
-                "tipo": tipo,
-                "codigo": codigo,
-                "nome": nome.upper(),
-                "preco": preco,
-                "variacao": variacao
-            }
-        except Exception as e:
-            return {"erro": f"Erro ao buscar ação: {str(e)}"}
-
-    elif tipo == "moeda":
-        try:
+        elif tipo == "moeda":
             url = f"https://economia.awesomeapi.com.br/json/last/{codigo}"
             response = requests.get(url)
             if response.status_code != 200:
                 return {"erro": "Código de moeda inválido ou não encontrado."}
             json_data = response.json()
-            if not json_data:
-                return {"erro": "Código de moeda inválido ou não encontrado."}
             key = list(json_data.keys())[0]
             data = json_data[key]
-            preco = data.get("bid")
-            variacao = data.get("pctChange")
+            preco = float(data.get("bid"))
+            variacao = float(data.get("pctChange"))
             nome = data.get("name")
+        else:
+            return {"erro": "Tipo inválido. Use 'acao' ou 'moeda'"}
 
-            if preco is None or nome is None:
-                return {"erro": "Código de moeda inválido ou não encontrado."}
+        preco_formatado = (
+            f"{preco:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            if tipo == "acao"
+            else f"{preco:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        )
+        variacao_formatada = f"{variacao:.2f}".replace(".", ",")
+        data_atual = datetime.now().strftime("%d/%m/%Y")
 
-            preco = f"{float(preco):,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            variacao = variacao.replace(".", ",")
+        conn = sqlite3.connect("stocks.db")
+        c = conn.cursor()
+        c.execute(
+            'INSERT INTO historico (data_consulta, tipo, codigo, nome, preco, variacao) VALUES (?, ?, ?, ?, ?, ?)',
+            (data_atual, tipo, codigo, nome.upper(), preco_formatado, variacao_formatada),
+        )
+        conn.commit()
+        conn.close()
 
-            data_atual = datetime.now().strftime("%d/%m/%Y")
-            historico_consultas.insert(0, {
-                "id": len(historico_consultas) + 1,
-                "data_consulta": data_atual,
-                "tipo": tipo,
-                "codigo": codigo,
-                "nome": nome.upper(),
-                "preco": preco,
-                "variacao": variacao
-            })
+        return {
+            "tipo": tipo,
+            "codigo": codigo,
+            "nome": nome.upper(),
+            "preco": preco_formatado,
+            "variacao": variacao_formatada,
+        }
 
-            return {
-                "tipo": tipo,
-                "codigo": codigo,
-                "nome": nome.upper(),
-                "preco": preco,
-                "variacao": variacao
-            }
-        except Exception as e:
-            return {"erro": f"Erro ao buscar moeda: {str(e)}"}
-
-    return {"erro": "Tipo inválido. Use 'acao' ou 'moeda'"}
+    except Exception as e:
+        return {"erro": f"Erro ao buscar dados: {str(e)}"}
 
 @app.get("/historico")
-def historico():
-    return historico_consultas
+def get_historico():
+    conn = sqlite3.connect("stocks.db")
+    c = conn.cursor()
+    c.execute("SELECT * FROM historico ORDER BY id DESC")
+    rows = c.fetchall()
+    conn.close()
+    return [
+        {
+            "id": row[0],
+            "data_consulta": row[1],
+            "tipo": row[2],
+            "codigo": row[3],
+            "nome": row[4],
+            "preco": row[5],
+            "variacao": row[6],
+        }
+        for row in rows
+    ]
 
 @app.post("/historico")
-def adicionar_item(item: dict):
-    item["id"] = len(historico_consultas) + 1
-    historico_consultas.append(item)
-    return item
+def adicionar_item(item: HistoricoItem):
+    conn = sqlite3.connect("stocks.db")
+    c = conn.cursor()
+    c.execute(
+        'INSERT INTO historico (data_consulta, tipo, codigo, nome, preco, variacao) VALUES (?, ?, ?, ?, ?, ?)',
+        (item.data_consulta, item.tipo, item.codigo, item.nome, item.preco, item.variacao),
+    )
+    conn.commit()
+    item_id = c.lastrowid
+    conn.close()
+    return {"id": item_id, **item.dict()}
 
 @app.put("/historico/{item_id}")
-def atualizar_item(item_id: int, novos_dados: dict):
-    for i, item in enumerate(historico_consultas):
-        if item["id"] == item_id:
-            historico_consultas[i].update(novos_dados)
-            return historico_consultas[i]
-    raise HTTPException(status_code=404, detail="Item não encontrado")
+def atualizar_item(item_id: int, novos_dados: HistoricoItem):
+    conn = sqlite3.connect("stocks.db")
+    c = conn.cursor()
+    c.execute(
+        'UPDATE historico SET data_consulta = ?, tipo = ?, codigo = ?, nome = ?, preco = ?, variacao = ? WHERE id = ?',
+        (
+            novos_dados.data_consulta,
+            novos_dados.tipo,
+            novos_dados.codigo,
+            novos_dados.nome,
+            novos_dados.preco,
+            novos_dados.variacao,
+            item_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return {"mensagem": f"Item com ID {item_id} atualizado com sucesso"}
 
 @app.delete("/historico/{item_id}")
 def deletar_item(item_id: int):
-    global historico_consultas
-    historico_consultas = [item for item in historico_consultas if item["id"] != item_id]
+    conn = sqlite3.connect("stocks.db")
+    c = conn.cursor()
+    c.execute("DELETE FROM historico WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
     return {"mensagem": f"Item com ID {item_id} deletado com sucesso"}
-
-@app.get("/grafico")
-def grafico(tipo: str = Query(...), codigo: str = Query(...)):
-    codigo = codigo.upper()
-    if tipo == "acao":
-        if not codigo.endswith(".SA") and not codigo.isalpha():
-            codigo += ".SA"
-        try:
-            ticker = yf.Ticker(codigo)
-            hist = ticker.history(period="90d")
-            if hist.empty:
-                return {"erro": "Histórico não encontrado."}
-            return [
-                {"data": idx.strftime("%d/%m"), "preco": round(row["Close"], 2)}
-                for idx, row in hist.iterrows()
-            ]
-        except Exception as e:
-            return {"erro": f"Erro ao buscar gráfico de ação: {str(e)}"}
-    elif tipo == "moeda":
-        try:
-            ticker = yf.Ticker(f"{codigo}=X")
-            hist = ticker.history(period="90d")
-            if hist.empty:
-                return {"erro": "Histórico não encontrado."}
-            return [
-                {"data": idx.strftime("%d/%m"), "preco": round(row["Close"], 4)}
-                for idx, row in hist.iterrows()
-            ]
-        except Exception as e:
-            return {"erro": f"Erro ao buscar gráfico de moeda: {str(e)}"}
-    else:
-        return {"erro": "Tipo inválido para gráfico. Use 'acao' ou 'moeda'."}
-
 
 
 
